@@ -1,6 +1,7 @@
 use anyhow::Result;
 use anyhow::bail;
 use reqwest::header;
+use tracing::Instrument as _;
 
 use crate::serenity;
 use crate::types::Context;
@@ -14,7 +15,7 @@ const USER_AGENT: &str = "kangalioo/rustbot";
 	category = "Utilities"
 )]
 #[tracing::instrument(
-	name = "discord.command.man",
+	name = "command.man",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -43,15 +44,23 @@ pub async fn man(
 		.http
 		.get(&url)
 		.header(header::USER_AGENT, USER_AGENT)
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"manpages.fetch",
+			"debian-manpages",
+		))
 		.send()
 		.await
 	{
 		if response.status() == 404 {
-			ctx.say("Man page not found.").await?;
+			ctx.say("Man page not found.")
+				.instrument(crate::helpers::discord_operation_span("reply.send"))
+				.await?;
 			return Ok(());
 		}
 	} else {
-		ctx.say("Failed to fetch man page.").await?;
+		ctx.say("Failed to fetch man page.")
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
@@ -73,6 +82,7 @@ pub async fn man(
 				.timestamp(serenity::Timestamp::now()),
 		),
 	)
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 
 	Ok(())

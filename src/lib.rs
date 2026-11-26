@@ -9,18 +9,18 @@
 )]
 
 use std::collections::HashMap;
+use std::future::IntoFuture as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use anyhow::{Error, anyhow};
-use futures::StreamExt;
-use poise::serenity_prelude::{self as serenity, ChannelType, Permissions};
-use rand::{Rng, seq::IteratorRandom};
+use poise::serenity_prelude as serenity;
 use tracing::{debug, info, warn};
 
 use crate::commands::modmail::{create_modmail_thread, load_or_create_modmail_message};
-use crate::types::Data;
+use crate::types::{Data, ExternalApiBases};
 
 const FAILED_CODEBLOCK: &str = "\\
 Missing code block. Please use the following markdown:
@@ -31,14 +31,12 @@ or
 code here
 `\x1b[0m`\x1b[0m`
 ```";
-const SERVER_ICON_CHANGE_TIMEOUT: Duration = Duration::from_secs(60);
-const SERVER_ICON_MAX_FAILURES: u32 = 5;
-const SERVER_ICON_INITIAL_BACKOFF_SECS: u64 = 60;
-const SERVER_ICON_MAX_BACKOFF_SECS: u64 = 60 * 60;
-
 pub mod checks;
 pub mod commands;
+pub mod discord;
 pub mod helpers;
+pub mod rustification;
+pub mod telemetry;
 pub mod types;
 
 pub struct SecretStore(pub HashMap<String, String>);
@@ -72,7 +70,45 @@ impl From<serenity::Client> for ShuttleSerenity {
 pub async fn serenity(
 	secret_store: SecretStore,
 	database: Option<sqlx::SqlitePool>,
+	intents: serenity::GatewayIntents,
+	rustification: rustification::RustificationConfig,
 ) -> Result<ShuttleSerenity, Error> {
+	let config = BotConfig {
+		secret_store,
+		database,
+		intents,
+		rustification,
+		discord_api_proxy: std::env::var("FERRIS_DISCORD_API_PROXY")
+			.ok()
+			.filter(|proxy| !proxy.trim().is_empty()),
+		external_apis: ExternalApiBases::from_env(),
+		server_icon_directory: PathBuf::from("assets/server-icons"),
+	};
+	Ok(build_bot(config).await?.into())
+}
+
+/// Configuration for constructing a bot without reading files or environment variables.
+pub struct BotConfig {
+	pub secret_store: SecretStore,
+	pub database: Option<sqlx::SqlitePool>,
+	pub intents: serenity::GatewayIntents,
+	pub discord_api_proxy: Option<String>,
+	pub external_apis: ExternalApiBases,
+	pub server_icon_directory: PathBuf,
+	pub rustification: rustification::RustificationConfig,
+}
+
+#[tracing::instrument(name = "bot.build", skip_all, err(Debug))]
+pub async fn build_bot(config: BotConfig) -> Result<serenity::Client, Error> {
+	let BotConfig {
+		secret_store,
+		database,
+		intents,
+		discord_api_proxy,
+		external_apis,
+		server_icon_directory,
+		rustification,
+	} = config;
 	let token = secret_store
 		.get("DISCORD_TOKEN")
 		.expect("Couldn't find your DISCORD_TOKEN!");
@@ -81,35 +117,50 @@ pub async fn serenity(
 	let command_list = build_command_list(enable_database);
 
 	if enable_database {
-		info!("Database enabled - registering database-dependent commands (tags, highlights)");
+		info!(
+			"Database enabled - registering database-dependent commands (tags, highlights, server icons)"
+		);
 	} else {
 		info!("Database disabled - skipping database-dependent commands");
 	}
 
 	let framework = poise::Framework::builder()
 		.setup(move |ctx, ready, framework| {
-			Box::pin(async move {
-				let data = Data::new(&secret_store, database).await?;
+			Box::pin(
+				async move {
+					let data = Data::new(
+						&secret_store,
+						database,
+						external_apis,
+						server_icon_directory,
+						rustification,
+					)
+					.await?;
 
-				info!(
-					"Registering {} commands...",
-					framework.options().commands.len()
-				);
-				poise::builtins::register_in_guild(
-					ctx,
-					&framework.options().commands,
-					data.discord_guild_id,
-				)
-				.await?;
+					info!(
+						"Registering {} commands...",
+						framework.options().commands.len()
+					);
+					poise::builtins::register_in_guild(
+						ctx,
+						&framework.options().commands,
+						data.discord_guild_id,
+					)
+					.instrument(crate::helpers::discord_operation_span("guild.set_commands"))
+					.await?;
 
-				debug!("Setting activity text");
-				ctx.set_activity(Some(serenity::ActivityData::listening("/help")));
+					debug!("Setting activity text");
+					crate::helpers::discord_operation_span("gateway.set_activity").in_scope(|| {
+						ctx.set_activity(Some(serenity::ActivityData::listening("/help")));
+					});
 
-				load_or_create_modmail_message(ctx, &data).await?;
+					load_or_create_modmail_message(ctx, &data).await?;
 
-				info!("ferrisbot-for-discord logged in as {}", ready.user.name);
-				Ok(data)
-			})
+					info!("ferrisbot-for-discord logged in as {}", ready.user.name);
+					Ok(data)
+				}
+				.instrument(tracing::info_span!("bot.setup")),
+			)
 		})
 		.options(poise::FrameworkOptions {
 			commands: command_list,
@@ -159,30 +210,6 @@ pub async fn serenity(
 					}
 				})
 			},
-			// This code is run before every command
-			pre_command: |ctx| {
-				Box::pin(async move {
-					let channel_name = &ctx
-						.channel_id()
-						.name(&ctx)
-						.await
-						.unwrap_or_else(|_| "<unknown>".to_owned());
-					let author = &ctx.author().name;
-
-					info!(
-						"{} in {} used slash command '{}'",
-						author,
-						channel_name,
-						&ctx.invoked_command_name()
-					);
-				})
-			},
-			// This code is run after a command if it was successful (returned Ok)
-			post_command: |ctx| {
-				Box::pin(async move {
-					info!("Executed command {}!", ctx.command().qualified_name);
-				})
-			},
 			// Every command invocation must pass this check to continue execution
 			command_check: Some(|_ctx| Box::pin(async move { Ok(true) })),
 			// Enforce command checks even for owners (enforced by default)
@@ -197,16 +224,8 @@ pub async fn serenity(
 		})
 		.build();
 
-	// Don't include presence updates, as they consume a lot of memory and CPU.
-	let intents = serenity::GatewayIntents::non_privileged()
-		| serenity::GatewayIntents::GUILD_MEMBERS
-		| serenity::GatewayIntents::MESSAGE_CONTENT;
-
 	let mut http = serenity::HttpBuilder::new(&token);
-	if let Some(proxy) = std::env::var("FERRIS_DISCORD_API_PROXY")
-		.ok()
-		.filter(|proxy| !proxy.trim().is_empty())
-	{
+	if let Some(proxy) = discord_api_proxy {
 		// Serenity's rate-limited request path does not apply its HTTP proxy.
 		// Proxies are expected to own rate limiting when one is configured.
 		http = http.proxy(proxy).ratelimiter_disabled(true);
@@ -214,10 +233,12 @@ pub async fn serenity(
 
 	let client = serenity::ClientBuilder::new_with_http(http.build(), intents)
 		.framework(framework)
+		.into_future()
+		.instrument(crate::helpers::discord_operation_span("client.initialize"))
 		.await
 		.map_err(|e| anyhow!(e))?;
 
-	Ok(client.into())
+	Ok(client)
 }
 
 fn build_command_list(enable_database: bool) -> Vec<poise::Command<Data, Error>> {
@@ -262,6 +283,7 @@ fn build_command_list(enable_database: bool) -> Vec<poise::Command<Data, Error>>
 			commands::highlight::highlight(),
 			commands::tags::tags(),
 			commands::tags::tag(),
+			commands::server_icon::server_icon(),
 		]);
 	}
 	command_list
@@ -272,7 +294,11 @@ fn build_command_list(enable_database: bool) -> Vec<poise::Command<Data, Error>>
 /// if we can't send an error message.
 async fn try_say(ctx: &poise::Context<'_, Data, Error>, message: impl Into<String>) {
 	let msg = message.into();
-	if let Err(e) = ctx.say(&msg).await {
+	if let Err(e) = ctx
+		.say(&msg)
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await
+	{
 		warn!(
 			"Failed to send message '{}...': {}",
 			&msg[..msg.len().min(50)],
@@ -292,74 +318,39 @@ async fn event_handler(
 	);
 
 	match event {
-		serenity::FullEvent::GuildMemberAddition { new_member } => {
-			const RUSTIFICATION_DELAY: u64 = 30; // in minutes
-
-			tokio::time::sleep(Duration::from_secs(RUSTIFICATION_DELAY * 60)).await;
-
-			// Ignore errors because the user may have left already
-			let _: Result<_, _> = ctx
-				.http
-				.add_member_role(
-					new_member.guild_id,
-					new_member.user.id,
-					data.rustacean_role_id,
-					Some(&format!(
-						"Automatically rustified after {RUSTIFICATION_DELAY} minutes"
-					)),
-				)
-				.await;
-		}
 		serenity::FullEvent::Ready { .. } => {
-			ensure_server_icon_changer(ctx, data).await;
+			if let Some(rustification) = &data.rustification {
+				rustification.start(ctx.http.clone()).await;
+			} else {
+				warn!("Automatic Rustacean assignment disabled because SQLite is disabled");
+			}
+			if let Some(rotation) = &data.server_icon_rotation {
+				rotation.start(ctx.http.clone()).await;
+			} else {
+				warn!("Server icon rotation disabled because SQLite is disabled");
+			}
 		}
 		serenity::FullEvent::Message { new_message } => {
+			if let Some(rustification) = &data.rustification
+				&& let Err(error) = rustification.observe_message(new_message).await
+			{
+				warn!(%error, "Failed to enqueue Rustacean assignment");
+			}
 			if let Some(gid) = new_message.guild_id
 				&& !new_message.author.bot
 			{
-				let hl = data.highlights.read().await;
-				let matches = hl.find(&new_message.content);
-				let message_link = new_message.link();
-				let message_link = &*message_link;
-				let mut stream = futures::stream::iter(matches)
-					.map(|(person_id, matcher)| async move {
-						if let Ok(member) = gid.member(ctx, person_id).await
-							&& let Ok(p) = gid.to_partial_guild(ctx).await
-							&& let Ok(Some(channel)) = if let Ok(Some(x)) = p
-								.channels(ctx)
-								.await
-								.map(|x| x.get(&new_message.channel_id).cloned())
-							{
-								Ok(Some(x))
-							} else {
-								p.get_active_threads(ctx).await.map(|x| {
-									x.threads
-										.iter()
-										.find(|th| th.id == new_message.channel_id)
-										.cloned()
-								})
-							} && let perms = p.user_permissions_in(&channel, &member)
-							&& perms.contains(Permissions::VIEW_CHANNEL)
-							&& (channel.kind != ChannelType::PrivateThread
-								|| channel
-									.id
-									.get_thread_member(ctx, member.user.id, true)
-									.await
-									.ok()
-									.map(|x| x.user_id) == Some(member.user.id))
-						{
-							_ = person_id
-								.direct_message(
-									ctx,
-									serenity::CreateMessage::new().content(format!(
-										"your match `{matcher}` was satisfied on message {message_link}",
-									)),
-								)
-								.await;
-						}
-					})
-					.buffer_unordered(8);
-				while let Some(()) = stream.next().await {}
+				let span = tracing::info_span!(
+					"highlight.check_message",
+					sampling.class = "message_highlight_check",
+					bot.id = data.application_id.get(),
+					highlight.matched = tracing::field::Empty,
+					guild.id = gid.get(),
+					channel.id = new_message.channel_id.get(),
+					message.id = new_message.id.get(),
+				);
+				commands::highlight::check_message(ctx, data, gid, new_message, span.clone())
+					.instrument(span)
+					.await;
 			}
 		}
 		serenity::FullEvent::InteractionCreate {
@@ -373,115 +364,4 @@ async fn event_handler(
 	}
 
 	Ok(())
-}
-
-async fn fetch_icon_paths() -> tokio::io::Result<Box<[PathBuf]>> {
-	let mut icon_paths = Vec::new();
-	let mut icon_path_iter = tokio::fs::read_dir("./assets/server-icons").await?;
-	while let Some(entry) = icon_path_iter.next_entry().await? {
-		let path = entry.path();
-		if path.is_file() {
-			icon_paths.push(path);
-		}
-	}
-
-	Ok(icon_paths.into())
-}
-
-async fn ensure_server_icon_changer(ctx: &serenity::Context, data: &Data) {
-	let mut task = data.server_icon_changer.lock().await;
-	if task.as_ref().is_some_and(|task| !task.is_finished()) {
-		return;
-	}
-
-	if task.take().is_some() {
-		warn!("Server icon changer stopped; restarting it");
-	}
-
-	let http = ctx.http.clone();
-	*task = Some(tokio::spawn(run_server_icon_changer(
-		http,
-		data.discord_guild_id,
-	)));
-}
-
-async fn run_server_icon_changer(ctx: impl serenity::CacheHttp, guild_id: serenity::GuildId) {
-	let mut consecutive_failures = 0;
-
-	loop {
-		let icon_paths = match fetch_icon_paths().await {
-			Ok(icon_paths) if !icon_paths.is_empty() => icon_paths,
-			Ok(_) => {
-				warn!("No server icons found in assets/server-icons");
-				wait_before_server_icon_retry(&mut consecutive_failures).await;
-				continue;
-			}
-			Err(error) => {
-				warn!("Failed to read server-icons directory: {error}");
-				wait_before_server_icon_retry(&mut consecutive_failures).await;
-				continue;
-			}
-		};
-
-		// Attempt to find all images and select one at random
-		let icon = icon_paths.iter().choose(&mut rand::rng());
-		if let Some(icon_path) = icon {
-			info!("Changing server icon to {:?}", icon_path);
-
-			// Attempt to change the server icon
-			let icon_change_result = match tokio::time::timeout(SERVER_ICON_CHANGE_TIMEOUT, async {
-				let icon = serenity::CreateAttachment::path(icon_path).await?;
-				let edit_guild = serenity::EditGuild::new().icon(Some(&icon));
-				guild_id.edit(&ctx, edit_guild).await
-			})
-			.await
-			{
-				Ok(Ok(_)) => Ok(()),
-				Ok(Err(error)) => Err(anyhow!(error)),
-				Err(error) => Err(anyhow!(
-					"timed out after {SERVER_ICON_CHANGE_TIMEOUT:?}: {error}"
-				)),
-			};
-
-			if let Err(e) = icon_change_result {
-				warn!("Failed to change server icon: {e}");
-				wait_before_server_icon_retry(&mut consecutive_failures).await;
-				continue;
-			}
-		}
-
-		consecutive_failures = 0;
-
-		// Sleep for between 24 and 48 hours
-		let sleep_duration = rand::rng().random_range((60 * 60 * 24)..(60 * 60 * 48));
-		info!("Server icon changed; next rotation in {sleep_duration:?}");
-		tokio::time::sleep(Duration::from_secs(sleep_duration)).await;
-	}
-}
-
-async fn wait_before_server_icon_retry(consecutive_failures: &mut u32) {
-	*consecutive_failures = consecutive_failures.saturating_add(1);
-
-	let sleep_duration = if *consecutive_failures >= SERVER_ICON_MAX_FAILURES {
-		let sleep_duration =
-			Duration::from_secs(rand::rng().random_range((60 * 60 * 24)..(60 * 60 * 48)));
-		warn!(
-			"Server icon changer reached {} consecutive failures; retrying with a new icon in {sleep_duration:?}",
-			*consecutive_failures,
-		);
-		*consecutive_failures = 0;
-		sleep_duration
-	} else {
-		let exponent = (*consecutive_failures - 1).min(6);
-		let backoff_secs = (SERVER_ICON_INITIAL_BACKOFF_SECS * 2u64.pow(exponent))
-			.min(SERVER_ICON_MAX_BACKOFF_SECS);
-		let sleep_duration = Duration::from_secs(backoff_secs);
-		warn!(
-			"Retrying server icon rotation after failure {} in {sleep_duration:?}",
-			*consecutive_failures,
-		);
-		sleep_duration
-	};
-
-	tokio::time::sleep(sleep_duration).await;
 }

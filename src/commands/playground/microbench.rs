@@ -1,6 +1,7 @@
 use anyhow::Error;
 use core::fmt::Write as _;
 use syn::{Item, ItemFn, Visibility, parse_file};
+use tracing::Instrument as _;
 
 use crate::types::Context;
 
@@ -67,7 +68,7 @@ fn bench(functions: &[(&str, fn())]) {
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.microbench",
+	name = "command.microbench",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -82,7 +83,9 @@ pub async fn microbench(
 	flags: poise::KeyValueArgs,
 	code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	let user_code = &code.code;
 	let black_box_hint = !user_code.contains("black_box");
@@ -94,11 +97,13 @@ pub async fn microbench(
 	match pub_fn_names.len() {
 		0 => {
 			ctx.say("No public functions (`pub fn`) found for benchmarking :thinking:")
+				.instrument(crate::helpers::discord_operation_span("reply.send"))
 				.await?;
 			return Ok(());
 		}
 		1 => {
 			ctx.say("Please include multiple functions. Times are not comparable across runs")
+				.instrument(crate::helpers::discord_operation_span("reply.send"))
 				.await?;
 			return Ok(());
 		}
@@ -121,7 +126,7 @@ pub async fn microbench(
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/execute")
+		.post(ctx.data().external_apis.playground_url("execute"))
 		.json(&PlaygroundRequest {
 			code: &code,
 			channel: flags.channel,
@@ -130,6 +135,10 @@ pub async fn microbench(
 			mode: Mode::Release, // benchmarks on debug don't make sense
 			tests: false,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.execute",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()

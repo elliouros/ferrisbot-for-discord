@@ -1,4 +1,5 @@
 use std::{collections::HashMap, mem::take};
+use tracing::Instrument as _;
 
 use anyhow::{Error, anyhow};
 use poise::{CodeBlockError, KeyValueArgs};
@@ -68,6 +69,7 @@ struct GodboltRequest<'a> {
 	rustc: &'a str,
 	flags: &'a str,
 	run_llvm_mca: bool,
+	api_base_url: String,
 }
 
 /// Compile a given Rust source code file on Godbolt using the latest nightly compiler with
@@ -79,9 +81,10 @@ async fn compile_rust_source(
 ) -> Result<Compilation, Error> {
 	let tools = make_tools_json(request.run_llvm_mca);
 
-	let http_request = http
+	let http_response = http
 		.post(format!(
-			"https://godbolt.org/api/compiler/{}/compile",
+			"{}/api/compiler/{}/compile",
+			request.api_base_url.trim_end_matches('/'),
 			request.rustc
 		))
 		.header(reqwest::header::ACCEPT, "application/json") // to make godbolt respond in JSON
@@ -93,9 +96,10 @@ async fn compile_rust_source(
                 // "libraries": [{"id": "itoa", "version": "102"}],
             },
         } })
-		.build()?;
+		.with_extension(crate::telemetry::ExternalOperation::new("godbolt.compile", "godbolt"))
+		.send().await?;
 
-	let response: GodboltResponse = http.execute(http_request).await?.json().await?;
+	let response: GodboltResponse = http_response.json().await?;
 
 	// TODO: use the extract_relevant_lines utility to strip stderr nicely
 	Ok(Compilation {
@@ -126,7 +130,10 @@ async fn save_to_shortlink(http: &ClientWithMiddleware, req: &GodboltRequest<'_>
 	let tools = make_tools_json(req.run_llvm_mca);
 
 	let request = http
-		.post("https://godbolt.org/api/shortener")
+		.post(format!(
+			"{}/api/shortener",
+			req.api_base_url.trim_end_matches('/'),
+		))
 		.json(&serde_json::json! { {
 			"sessions": [{
 				"language": "rust",
@@ -143,6 +150,10 @@ async fn save_to_shortlink(http: &ClientWithMiddleware, req: &GodboltRequest<'_>
 	let url = async move {
 		Ok::<_, crate::Error>(
 			request
+				.with_extension(crate::telemetry::ExternalOperation::new(
+					"godbolt.shortlink.create",
+					"godbolt",
+				))
 				.send()
 				.await?
 				.json::<GodboltShortenerResponse>()
@@ -226,6 +237,7 @@ async fn respond_codeblocks(
 				)
 				.await,
 			)
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
 			.await?;
 		}
 	}
@@ -252,6 +264,7 @@ async fn respond_codeblock(
 		)
 		.await,
 	)
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 	Ok(())
 }
@@ -322,7 +335,7 @@ fn parse(args: &str) -> Result<(KeyValueArgs, String), CodeBlockError> {
 )]
 #[poise::command(prefix_command, category = "Godbolt", broadcast_typing, track_edits)]
 #[tracing::instrument(
-	name = "discord.command.godbolt",
+	name = "command.godbolt",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -360,6 +373,7 @@ pub async fn godbolt(ctx: Context<'_>, #[rest] arguments: String) -> Result<(), 
 		rustc: &rustc,
 		flags: &flags,
 		run_llvm_mca: false,
+		api_base_url: ctx.data().external_apis.godbolt_url(""),
 	};
 	let godbolt_result = compile_rust_source(&ctx.data().http, &godbolt_request).await?;
 
@@ -387,7 +401,7 @@ pub async fn godbolt(ctx: Context<'_>, #[rest] arguments: String) -> Result<(), 
 )]
 #[poise::command(prefix_command, category = "Godbolt", broadcast_typing, track_edits)]
 #[tracing::instrument(
-	name = "discord.command.mca",
+	name = "command.mca",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -406,6 +420,7 @@ pub async fn mca(ctx: Context<'_>, #[rest] arguments: String) -> Result<(), Erro
 		rustc: &rustc,
 		flags: &flags,
 		run_llvm_mca: true,
+		api_base_url: ctx.data().external_apis.godbolt_url(""),
 	};
 
 	let godbolt_result = compile_rust_source(&ctx.data().http, &godbolt_request).await?;
@@ -436,7 +451,7 @@ pub async fn mca(ctx: Context<'_>, #[rest] arguments: String) -> Result<(), Erro
 )]
 #[poise::command(prefix_command, category = "Godbolt", broadcast_typing, track_edits)]
 #[tracing::instrument(
-	name = "discord.command.llvmir",
+	name = "command.llvmir",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -455,6 +470,7 @@ pub async fn llvmir(ctx: Context<'_>, #[rest] arguments: String) -> Result<(), E
 		rustc: &rustc,
 		flags: &(flags + " --emit=llvm-ir -Cdebuginfo=0"),
 		run_llvm_mca: false,
+		api_base_url: ctx.data().external_apis.godbolt_url(""),
 	};
 	let godbolt_result = compile_rust_source(&ctx.data().http, &godbolt_request).await?;
 

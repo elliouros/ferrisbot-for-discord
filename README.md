@@ -10,9 +10,8 @@ A Discord bot for the Rust programming language community Discord server, nickna
 Some permissions are required:
 
 - Send Messages: base command functionality
-- Manage Roles: for `?rustify` command
+- Manage Roles: for automatic Rustacean assignment
 - Manage Messages: for `?cleanup` command
-- Add Reactions: for `?rustify` command feedback
 
 Furthermore, the `applications.commands` OAuth2 scope is required for slash commands.
 
@@ -28,6 +27,57 @@ The application loads configuration from two TOML files plus environment variabl
 
 - `config/ferris.toml` (optional): general settings.
 - `config/ferris.secrets.toml` (required): copy from `config/ferris.secrets.template.toml` and fill in the required secrets.
+
+`[gateway].privileged_intents` optionally enables `guild_members`, `guild_presences`, or `message_content`. All non-privileged intents are enabled automatically. Only enable privileged intents that are also enabled for the application in the Discord Developer Portal.
+
+## Automatic Rustacean role
+
+With SQLite enabled, Ferris assigns the configured Rustacean role once a member
+has been in the configured server for 30 minutes by default. Set the delay in
+`config/ferris.toml`:
+
+```toml
+[rustification]
+delay_seconds = 1800
+```
+
+The environment override is `FERRIS_RUSTIFICATION__DELAY_SECONDS`. Zero allows
+immediate assignment. Pending entries retain their persisted wake-up times;
+eligibility is rechecked using the current delay before granting.
+
+Discord system welcome messages (`USER_JOIN`) schedule assignments; ordinary
+messages also repair missed joins.
+Members who already have the role are skipped using the message's member data,
+without a database query or HTTP request. Messages from members missing the role
+upsert one queue entry per user; duplicate observations preserve the deadline and
+retry backoff. Message text is not inspected.
+
+The queue survives bot restarts. A single worker checks up to 100 due entries per
+pass, waking only on new or changed entries or the next persisted deadline.
+An empty queue sleeps indefinitely; duplicate observations do not wake the worker.
+Database failures use a 60-second retry timer.
+It fetches each member before assigning to check the current join time, existing
+role, and membership screening.
+Departed members are discarded; failures retry after 60 seconds. Leaving and
+rejoining starts a fresh wait using the configured delay.
+
+Enable Discord's system welcome messages in a channel Ferris can view to schedule
+silent members. A join missed during downtime is repaired on the member's next
+message in a channel Ferris can view; channel history is not scanned. There is no
+`/rustify` command. Neither Guild Members nor Message Content privileged intents
+are required for role assignment. Ferris needs Manage Roles and its highest role
+must be above Rustacean. Disabling SQLite disables this feature.
+
+## Server icon catalogue
+
+`/server_icon list` shows 12 labelled previews per page in one message. Previous
+and Next replace the same contact sheet; only the person who opened it can turn
+pages. Controls disable after ten minutes, leaving the last page visible. Small
+catalogues show a single sheet without buttons. Animated icons use a still frame.
+The command trace ends once the catalogue is sent. Each button click and the
+expiry cleanup start a separate trace linked to the original command through an
+OpenTelemetry span link; idle browsing holds no span open.
+Moderators can pass a displayed name to `/server_icon set` as its `suffix`.
 
 ## Database setup (sqlx)
 
@@ -56,6 +106,11 @@ The repository ships with a `Containerfile` and `compose.yaml` for containerized
 To run migrations inside the container instead of locally, you can use `docker compose run --rm ferris cargo sqlx database migrate` (or `... database setup` / `... prepare`).
 
 If you need to access the container directly, you can use `docker compose run --rm --entrypoint /bin/sh ferris`.
+
+## Local development and tests
+
+- [Local Discord and tracing stack](local-test/README.md): run the bot with Fauxcord and Jaeger.
+- [Command integration tests](tests/README.md): run Rust tests, review snapshots, and refresh API fixtures.
 
 ## Credits
 

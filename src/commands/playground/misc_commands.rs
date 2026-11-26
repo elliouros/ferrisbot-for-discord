@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use tracing::Instrument as _;
 
 use anyhow::Error;
 use tracing::warn;
@@ -11,9 +12,8 @@ use super::{
 		apply_online_rustfmt,
 	},
 	util::{
-		GenericHelp, ResultHandling, extract_relevant_lines, generic_help, maybe_wrap,
-		maybe_wrapped, parse_flags, send_reply, strip_fn_main_boilerplate_from_formatted,
-		stub_message,
+		GenericHelp, ResultHandling, extract_relevant_lines, generic_help, maybe_wrapped,
+		parse_flags, send_reply, strip_fn_main_boilerplate_from_formatted, stub_message,
 	},
 };
 
@@ -25,7 +25,7 @@ use super::{
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.miri",
+	name = "command.miri",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -40,24 +40,29 @@ pub async fn miri(
 	flags: poise::KeyValueArgs,
 	code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	let code = &maybe_wrapped(
 		&code.code,
 		ResultHandling::Discard,
 		ctx.prefix().contains("Sweat"),
-		false,
 	);
 	let (flags, flag_parse_errors) = parse_flags(flags);
 
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/miri")
+		.post(ctx.data().external_apis.playground_url("miri"))
 		.json(&MiriRequest {
 			code,
 			edition: flags.edition,
 			aliasing_model: flags.aliasing_model,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.miri",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()
@@ -97,7 +102,7 @@ pub fn miri_help() -> String {
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.expand",
+	name = "command.expand",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -112,20 +117,26 @@ pub async fn expand(
 	flags: poise::KeyValueArgs,
 	code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
-	let code = maybe_wrap(&code.code, ResultHandling::None);
+	let code = maybe_wrapped(&code.code, ResultHandling::None, false);
 	let was_fn_main_wrapped = matches!(code, Cow::Owned(_));
 	let (flags, flag_parse_errors) = parse_flags(flags);
 
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/macro-expansion")
+		.post(ctx.data().external_apis.playground_url("macro-expansion"))
 		.json(&MacroExpansionRequest {
 			code: &code,
 			edition: flags.edition,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.expand",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()
@@ -184,7 +195,7 @@ pub fn expand_help() -> String {
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.clippy",
+	name = "command.clippy",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -199,17 +210,18 @@ pub async fn clippy(
 	flags: poise::KeyValueArgs,
 	code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	let code = &format!(
 		// dead_code: https://github.com/kangalioo/rustbot/issues/44
 		// let_unit_value: silence warning about `let _ = { ... }` wrapper that swallows return val
-		"#![allow(dead_code, clippy::let_unit_value)] {}",
+		"#![allow(dead_code, clippy::let_unit_value)]\n{}",
 		maybe_wrapped(
 			&code.code,
 			ResultHandling::Discard,
 			ctx.prefix().contains("Sweat"),
-			false,
 		)
 	);
 	let (flags, flag_parse_errors) = parse_flags(flags);
@@ -217,12 +229,16 @@ pub async fn clippy(
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/clippy")
+		.post(ctx.data().external_apis.playground_url("clippy"))
 		.json(&ClippyRequest {
 			code,
 			edition: flags.edition,
 			crate_type: CrateType::Binary,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.clippy",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()
@@ -264,7 +280,7 @@ pub fn clippy_help() -> String {
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.fmt",
+	name = "command.fmt",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -279,9 +295,11 @@ pub async fn fmt(
 	flags: poise::KeyValueArgs,
 	code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
-	let code = &maybe_wrap(&code.code, ResultHandling::None);
+	let code = &maybe_wrapped(&code.code, ResultHandling::None, false);
 	let was_fn_main_wrapped = matches!(code, Cow::Owned(_));
 	let (flags, flag_parse_errors) = parse_flags(flags);
 

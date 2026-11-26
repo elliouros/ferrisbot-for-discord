@@ -1,4 +1,5 @@
 use anyhow::Error;
+use tracing::Instrument as _;
 
 use crate::types::Context;
 
@@ -18,14 +19,19 @@ async fn play_or_eval(
 	code: poise::CodeBlock,
 	result_handling: ResultHandling,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
-	let code = maybe_wrapped(
-		&code.code,
-		result_handling,
-		ctx.prefix().contains("Sweat"),
-		ctx.prefix().contains("OwO") || ctx.prefix().contains("Cat"),
-	);
+	let result_handling = match result_handling {
+		ResultHandling::Print if ctx.prefix().contains("OwO") || ctx.prefix().contains("Cat") => {
+			ResultHandling::Pretty
+		}
+		handling => handling,
+	};
+	let unsf = ctx.prefix().contains("Sweat");
+
+	let code = maybe_wrapped(&code.code, result_handling, unsf);
 	let (mut flags, flag_parse_errors) = parse_flags(flags);
 
 	if force_warnings {
@@ -35,7 +41,7 @@ async fn play_or_eval(
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/execute")
+		.post(ctx.data().external_apis.playground_url("execute"))
 		.json(&PlaygroundRequest {
 			code: &code,
 			channel: flags.channel,
@@ -44,6 +50,10 @@ async fn play_or_eval(
 			mode: flags.mode,
 			tests: false,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.execute",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()
@@ -62,7 +72,7 @@ async fn play_or_eval(
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.play",
+	name = "command.play",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -101,7 +111,7 @@ help_text_fn = "playwarn_help",
 category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.playwarn",
+	name = "command.playwarn",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -140,7 +150,7 @@ pub fn playwarn_help() -> String {
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.eval",
+	name = "command.eval",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,

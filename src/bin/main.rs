@@ -10,15 +10,19 @@ use opentelemetry_sdk::{
 	Resource,
 	trace::{Sampler, SdkTracerProvider},
 };
+use poise::serenity_prelude::GatewayIntents;
 use serde::Deserialize;
 use serde_json::json;
 use snafu::{Report, ResultExt as _, Snafu};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tokio::runtime::Runtime;
+use tracing::Instrument as _;
 use tracing::{debug, error, info, level_filters::LevelFilter, warn};
 use tracing_appender::rolling::{self, RollingFileAppender, Rotation};
 use tracing_log::AsLog as _;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt as _};
+
+mod shutdown;
 
 #[derive(Deserialize, Debug)]
 struct LogConfig {
@@ -46,10 +50,43 @@ struct TelemetryConfig {
 	sample_rate: f64,
 }
 
+#[derive(Deserialize, Default, Debug)]
+struct GatewayConfig {
+	#[serde(default)]
+	privileged_intents: Vec<PrivilegedGatewayIntent>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum PrivilegedGatewayIntent {
+	GuildMembers,
+	GuildPresences,
+	MessageContent,
+}
+
+impl GatewayConfig {
+	fn intents(&self) -> GatewayIntents {
+		self.privileged_intents
+			.iter()
+			.fold(GatewayIntents::non_privileged(), |intents, intent| {
+				intents
+					| match intent {
+						PrivilegedGatewayIntent::GuildMembers => GatewayIntents::GUILD_MEMBERS,
+						PrivilegedGatewayIntent::GuildPresences => GatewayIntents::GUILD_PRESENCES,
+						PrivilegedGatewayIntent::MessageContent => GatewayIntents::MESSAGE_CONTENT,
+					}
+			})
+	}
+}
+
 #[derive(Deserialize, Debug)]
 struct Config {
 	log: LogConfig,
 	database: DatabaseConfig,
+	#[serde(default)]
+	gateway: GatewayConfig,
+	#[serde(default)]
+	rustification: ferrisbot_for_discord::rustification::RustificationConfig,
 	#[serde(default)]
 	telemetry: Option<TelemetryConfig>,
 	secrets: HashMap<String, String>,
@@ -70,6 +107,9 @@ static DEFAULT_CONFIG: LazyLock<serde_json::Value> = LazyLock::new(|| {
 			"disabled": false,
 			"url": "sqlite://database/ferris.sqlite3"
 		},
+		"gateway": {
+			"privileged_intents": []
+		},
 		"secrets": {}
 	})
 });
@@ -87,6 +127,8 @@ enum LogRotation {
 fn app(config: &Config) -> Result<(), AppError> {
 	let rt = Runtime::new().context(TokioRuntimeSnafu)?;
 	rt.block_on(async {
+		// Install handlers before initialization so an early signal is retained.
+		let signal = shutdown::signal().context(ShutdownSignalSnafu)?;
 		let pool = if config.database.disabled {
 			warn!("database disabled via config (database.disabled = true)");
 			None
@@ -100,6 +142,7 @@ fn app(config: &Config) -> Result<(), AppError> {
 				.create_if_missing(true);
 
 			let pool = SqlitePool::connect_with(opts)
+				.instrument(ferrisbot_for_discord::telemetry::sqlite_span("CONNECT", ""))
 				.await
 				.context(DatabaseSnafu {
 					url: config.database.url.to_owned(),
@@ -107,6 +150,7 @@ fn app(config: &Config) -> Result<(), AppError> {
 
 			sqlx::migrate!()
 				.run(&pool)
+				.instrument(ferrisbot_for_discord::telemetry::sqlite_span("MIGRATE", ""))
 				.await
 				.expect("Failed to run migrations");
 
@@ -123,13 +167,29 @@ fn app(config: &Config) -> Result<(), AppError> {
 				.collect(),
 		);
 
-		let mut client = ferrisbot_for_discord::serenity(secret_store, pool)
-			.await
-			.context(SerenityInitSnafu)?;
+		info!(
+			privileged_intents = ?config.gateway.privileged_intents,
+			"configured privileged Discord gateway intents"
+		);
+		let mut client = ferrisbot_for_discord::serenity(
+			secret_store,
+			pool,
+			config.gateway.intents(),
+			config.rustification,
+		)
+		.await
+		.context(SerenityInitSnafu)?;
 
 		info!("starting serenity...");
 
-		client.0.start_autosharded().await.context(SerenitySnafu)?;
+		let manager = client.0.shard_manager.clone();
+		shutdown::run_until_shutdown(
+			client.0.start_autosharded(),
+			signal,
+			manager.shutdown_all(),
+			std::time::Duration::from_secs(20),
+		)
+		.await?;
 
 		info!("serenity stopped");
 
@@ -284,10 +344,10 @@ fn main() {
 		}
 	}
 
-	if let Some(provider) = tracer_provider
-		&& let Err(err) = provider.shutdown()
-	{
-		warn!(error = %err, "OpenTelemetry tracer shutdown failed");
+	// The application runtime has stopped, so no Gateway tasks can add more spans.
+	// Keep the logging guards alive while the blocking exporter drains its batches.
+	if let Some(provider) = tracer_provider {
+		shutdown::flush_telemetry(provider);
 	}
 }
 
@@ -330,7 +390,64 @@ fn check_for_config_files(main: &PathBuf, secrets: &PathBuf) {
 
 #[cfg(test)]
 mod tests {
-	use super::{TelemetryConfig, build_tracer_provider};
+	use super::{GatewayConfig, PrivilegedGatewayIntent, TelemetryConfig, build_tracer_provider};
+	use poise::serenity_prelude::GatewayIntents;
+
+	#[test]
+	fn rustification_config_defaults_to_thirty_minutes_and_accepts_override() {
+		let config: super::Config = figment::Figment::new()
+			.merge(figment::providers::Serialized::defaults(
+				&*super::DEFAULT_CONFIG,
+			))
+			.extract()
+			.unwrap();
+		assert_eq!(config.rustification.delay_seconds, 1800);
+		let config: super::Config = figment::Figment::new()
+			.merge(figment::providers::Serialized::defaults(
+				&*super::DEFAULT_CONFIG,
+			))
+			.merge(figment::providers::Serialized::defaults(
+				serde_json::json!({
+					"rustification": { "delay_seconds": 3 }
+				}),
+			))
+			.extract()
+			.unwrap();
+		assert_eq!(config.rustification.delay_seconds, 3);
+	}
+
+	#[test]
+	fn rustification_config_rejects_negative_and_overflowing_delays() {
+		for delay in [
+			serde_json::json!(-1),
+			serde_json::json!(u64::from(u32::MAX) + 1),
+		] {
+			let result = serde_json::from_value::<
+				ferrisbot_for_discord::rustification::RustificationConfig,
+			>(serde_json::json!({"delay_seconds": delay}));
+			assert!(result.is_err());
+		}
+	}
+
+	#[test]
+	fn gateway_intents_default_to_non_privileged() {
+		assert_eq!(
+			GatewayConfig::default().intents(),
+			GatewayIntents::non_privileged()
+		);
+	}
+
+	#[test]
+	fn gateway_intents_include_only_configured_privileged_intents() {
+		let config = GatewayConfig {
+			privileged_intents: vec![PrivilegedGatewayIntent::MessageContent],
+		};
+
+		assert_eq!(
+			config.intents(),
+			GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT
+		);
+	}
 
 	#[test]
 	fn builds_http_otlp_tracer_provider() {
@@ -371,6 +488,10 @@ enum AppError {
 		#[snafu(source(from(poise::serenity_prelude::Error, Box::new)))]
 		source: Box<poise::serenity_prelude::Error>,
 	},
+	#[snafu(display("failed to listen for shutdown signals"))]
+	ShutdownSignal { source: std::io::Error },
+	#[snafu(display("Discord Gateway shutdown exceeded its grace period"))]
+	ShutdownTimeout { source: tokio::time::error::Elapsed },
 	#[snafu(display("failed to build OTLP span exporter"))]
 	Otlp {
 		source: opentelemetry_otlp::ExporterBuildError,

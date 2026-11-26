@@ -5,6 +5,7 @@ use futures::stream::FuturesUnordered;
 use reqwest::header;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::Deserialize;
+use tracing::Instrument as _;
 use tracing::info;
 
 use crate::serenity;
@@ -42,6 +43,10 @@ async fn get_crate(http: &ClientWithMiddleware, query: &str) -> Result<Crate> {
 		.get("https://crates.io/api/v1/crates")
 		.header(header::USER_AGENT, USER_AGENT)
 		.query(&[("q", query)])
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"crates.search",
+			"crates.io",
+		))
 		.send()
 		.await?
 		.json::<Crates>()
@@ -84,24 +89,32 @@ fn format_number(mut n: u64) -> String {
 }
 
 async fn autocomplete_crate(ctx: Context<'_>, partial: &str) -> impl Iterator<Item = String> {
-	let http = &ctx.data().http;
+	async {
+		let http = &ctx.data().http;
 
-	let response = http
-		.get("https://crates.io/api/v1/crates")
-		.header(header::USER_AGENT, USER_AGENT)
-		.query(&[("q", partial), ("per_page", "25"), ("sort", "downloads")])
-		.send()
-		.await;
+		let response = http
+			.get("https://crates.io/api/v1/crates")
+			.header(header::USER_AGENT, USER_AGENT)
+			.query(&[("q", partial), ("per_page", "25"), ("sort", "downloads")])
+			.with_extension(crate::telemetry::ExternalOperation::new(
+				"crates.search",
+				"crates.io",
+			))
+			.send()
+			.await;
 
-	let crate_list = match response {
-		Ok(response) => response.json::<Crates>().await.ok(),
-		Err(_) => None,
-	};
+		let crate_list = match response {
+			Ok(response) => response.json::<Crates>().await.ok(),
+			Err(_) => None,
+		};
 
-	crate_list
-		.map_or(Vec::new(), |list| list.crates)
-		.into_iter()
-		.map(|crate_| crate_.name)
+		crate_list
+			.map_or(Vec::new(), |list| list.crates)
+			.into_iter()
+			.map(|crate_| crate_.name)
+	}
+	.instrument(tracing::info_span!("autocomplete.crate"))
+	.await
 }
 
 /// Lookup crates on crates.io
@@ -118,7 +131,7 @@ async fn autocomplete_crate(ctx: Context<'_>, partial: &str) -> impl Iterator<It
 	category = "Crates"
 )]
 #[tracing::instrument(
-	name = "discord.command.crate",
+	name = "command.crate",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -135,7 +148,9 @@ pub async fn crate_(
 	crate_name: String,
 ) -> Result<()> {
 	if let Some(url) = rustc_crate_link(&crate_name) {
-		ctx.say(url).await?;
+		ctx.say(url)
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
@@ -170,6 +185,7 @@ pub async fn crate_(
 				.color(crate::types::EMBED_COLOR),
 		),
 	)
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 
 	Ok(())
@@ -238,7 +254,7 @@ fn rustc_crate_link(crate_name: &str) -> Option<&'static str> {
 	category = "Crates"
 )]
 #[tracing::instrument(
-	name = "discord.command.doc",
+	name = "command.doc",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -253,6 +269,7 @@ pub async fn doc(
 	#[description = "Path of the crate and item to lookup"] query: String,
 ) -> Result<()> {
 	ctx.say(path_to_doc_url(&query, &ctx.data().http).await?)
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
 		.await?;
 
 	Ok(())
@@ -469,6 +486,10 @@ impl DocsClient for ClientWithMiddleware {
 	async fn page_exists(&self, url: &str) -> bool {
 		self.head(url)
 			.header(header::USER_AGENT, USER_AGENT)
+			.with_extension(crate::telemetry::ExternalOperation::new(
+				"rust-docs.page_exists",
+				"rust-docs",
+			))
 			.send()
 			.await
 			.is_ok_and(|resp| resp.status() == reqwest::StatusCode::OK)

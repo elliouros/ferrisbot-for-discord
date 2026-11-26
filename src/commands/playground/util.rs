@@ -1,5 +1,6 @@
 use core::fmt::Write as _;
 use std::borrow::Cow;
+use tracing::Instrument as _;
 
 use poise::serenity_prelude as serenity;
 use serenity::ComponentInteraction;
@@ -174,9 +175,13 @@ pub enum ResultHandling {
 	Discard,
 	/// Print the result with `println!("{:?}")`
 	Print,
+	/// Print the result with `println!("{:#?}")`
+	Pretty,
 }
 
 pub fn split_attributes_from_code(code: &str) -> (&str, &str) {
+	const LINE_SUBSTR_ERROR: &str = "Line borrowed from str should be a substr.";
+
 	let mut lines = code.lines().peekable();
 
 	let mut attrs_end_point = 0;
@@ -184,8 +189,7 @@ pub fn split_attributes_from_code(code: &str) -> (&str, &str) {
 
 	while let Some(line) = lines.peek() {
 		let trimmed = line.trim();
-		const LINE_SUBSTR_ERROR: &str = "Line borrowed from str should be a substr.";
-		if trimmed.starts_with("#![") && trimmed.ends_with("]") {
+		if trimmed.starts_with("#![") && trimmed.ends_with(']') {
 			attrs_end_point = code.substr_range(line).expect(LINE_SUBSTR_ERROR).end;
 		} else if line.is_empty() {
 			// do nothing, maybe more crate attributes are coming
@@ -239,16 +243,7 @@ pub fn hoise_crate_attributes(code: &str, after_crate_attrs: &str, after_code: &
 /// Utility used by the commands to wrap the given code in a `fn main` if not already wrapped.
 /// To check, whether a wrap was done, check if the return type is `Cow::Borrowed` vs `Cow::Owned`
 /// If a wrap was done, also hoists crate attributes to the top so they keep working
-pub fn maybe_wrap(code: &str, result_handling: ResultHandling) -> Cow<'_, str> {
-	maybe_wrapped(code, result_handling, false, false)
-}
-
-pub fn maybe_wrapped(
-	code: &str,
-	result_handling: ResultHandling,
-	unsf: bool,
-	pretty: bool,
-) -> Cow<'_, str> {
+pub fn maybe_wrapped(code: &str, result_handling: ResultHandling, unsf: bool) -> Cow<'_, str> {
 	use syn::{File, Item, ItemFn, parse_str};
 
 	// If there is a `fn main()`, return the input back unchanged
@@ -272,25 +267,25 @@ pub fn maybe_wrapped(
 
 	let (attrs, rest) = split_attributes_from_code(code);
 
-	let formatted = match unsf {
-		true => format_args!("unsafe {{\n{rest}\n}}"),
-		false => format_args!("{rest}"),
+	let block = if unsf {
+		format_args!("unsafe {{\n{rest}\n}}")
+	} else {
+		format_args!("{{\n{rest}\n}}")
 	};
 
 	#[rustfmt::skip]
-	let formatted = match result_handling {
-		ResultHandling::None =>            format_args!("\n{formatted}\n"),
-		ResultHandling::Discard =>         format_args!(" let _ = {{\n{formatted}\n}}; "),
-		ResultHandling::Print if pretty => format_args!(" println!(\"{{:#?}}\", {{\n{formatted}\n}}); "),
-		ResultHandling::Print =>           format_args!(" println!(\"{{:?}}\", {{\n{formatted}\n}}); "),
+	let body = match result_handling {
+		ResultHandling::None if unsf => format_args!("{{ {block} }}"), // `fn main() { unsafe {\n...\n} }`
+		ResultHandling::None =>         block,                         // `fn main() {\n...\n}`
+		ResultHandling::Discard =>      format_args!("{{ let _ = {block}; }}"),
+		ResultHandling::Pretty =>       format_args!("{{ println!(\"{{:#?}}\", {block}); }}"),
+		ResultHandling::Print =>        format_args!("{{ println!(\"{{:?}}\", {block}); }}"),
 	};
 
 	Cow::Owned(format!(
 		"\
 		{attrs}\n\
-		fn main() {{\
-		{formatted}\
-		}}"
+		fn main() {body}"
 	))
 }
 
@@ -309,7 +304,9 @@ pub async fn send_reply(
 	// Discord displays empty code blocks weirdly if they're not formatted in a specific style,
 	// so we special-case empty code blocks
 	if result.trim().is_empty() {
-		ctx.say(format!("{flag_parse_errors}``` ```")).await?;
+		ctx.say(format!("{flag_parse_errors}``` ```"))
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
@@ -347,25 +344,33 @@ pub async fn send_reply(
 			}
 			b
 		})
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
 		.await?;
 
-	if let Some(retry_pressed) = response
-		.message()
-		.await?
-		.await_component_interaction(ctx)
-		.filter(move |mci: &ComponentInteraction| mci.data.custom_id == custom_id)
-		.timeout(std::time::Duration::from_mins(10))
-		.await
-	{
-		retry_pressed.defer(&ctx).await?;
-		ctx.rerun().await?;
-	} else {
-		// If timed out, just remove the button
-		// Errors are ignored in case the reply was deleted
-		let _ = response
-			// TODO: Add code to remove button
-			.edit(ctx, poise::CreateReply::default())
-			.await;
+	// Only timeout replies have a Retry button; waiting otherwise keeps command spans open.
+	if timeout {
+		if let Some(retry_pressed) = response
+			.message()
+			.instrument(crate::helpers::discord_operation_span("reply.fetch"))
+			.await?
+			.await_component_interaction(ctx)
+			.filter(move |mci: &ComponentInteraction| mci.data.custom_id == custom_id)
+			.timeout(std::time::Duration::from_mins(10))
+			.await
+		{
+			retry_pressed
+				.defer(&ctx)
+				.instrument(crate::helpers::discord_operation_span("interaction.defer"))
+				.await?;
+			ctx.rerun().await?;
+		} else {
+			// If timed out, just remove the button
+			// Errors are ignored in case the reply was deleted
+			let _ = response
+				.edit(ctx, poise::CreateReply::default())
+				.instrument(crate::helpers::discord_operation_span("reply.edit"))
+				.await;
+		}
 	}
 
 	Ok(())

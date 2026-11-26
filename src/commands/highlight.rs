@@ -1,10 +1,16 @@
+use futures::StreamExt as _;
 use std::collections::HashMap;
+use tracing::Instrument as _;
 
-use crate::{require_database, types::Context};
+use crate::{
+	helpers::discord_operation_span,
+	require_database,
+	types::{Context, Data},
+};
 use anyhow::{Error, Result};
 use poise::{
 	CreateReply,
-	serenity_prelude::{CreateEmbed, UserId},
+	serenity_prelude::{self as serenity, ChannelType, CreateEmbed, Permissions, UserId},
 };
 use regex::{Regex, RegexBuilder};
 use sqlx::{Pool, Sqlite};
@@ -17,7 +23,7 @@ use sqlx::{Pool, Sqlite};
 	subcommand_required
 )]
 #[tracing::instrument(
-	name = "discord.command.highlight",
+	name = "command.highlight",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -34,7 +40,7 @@ pub async fn highlight(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(prefix_command, slash_command)]
 /// Adds a highlight. When a highlight is matched, you will receive a DM.
 #[tracing::instrument(
-	name = "discord.command.highlight.add",
+	name = "command.highlight.add",
 	skip_all,
 	fields(
 		command = %c.command().qualified_name,
@@ -48,14 +54,18 @@ pub async fn add(c: Context<'_>, regex: String) -> Result<()> {
 	let db = require_database!(c);
 
 	if let Err(e) = RegexBuilder::new(&regex).size_limit(1 << 10).build() {
-		c.say(format!("```\n{e}```")).await?;
+		c.say(format!("```\n{e}```"))
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
 	database::highlight_add(db, c.author().id, &regex).await?;
 
 	RegexHolder::update(c.data()).await;
-	c.say("hl added!").await?;
+	c.say("hl added!")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	Ok(())
 }
@@ -63,7 +73,7 @@ pub async fn add(c: Context<'_>, regex: String) -> Result<()> {
 #[poise::command(prefix_command, slash_command)]
 /// Removes a highlight by ID.
 #[tracing::instrument(
-	name = "discord.command.highlight.remove",
+	name = "command.highlight.remove",
 	skip_all,
 	fields(
 		command = %c.command().qualified_name,
@@ -85,6 +95,7 @@ pub async fn remove(c: Context<'_>, id: i64) -> Result<()> {
 			"hl not found."
 		}
 	})
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 
 	RegexHolder::update(c.data()).await;
@@ -95,7 +106,7 @@ pub async fn remove(c: Context<'_>, id: i64) -> Result<()> {
 #[poise::command(prefix_command, slash_command)]
 /// Lists your current highlights
 #[tracing::instrument(
-	name = "discord.command.highlight.list",
+	name = "command.highlight.list",
 	skip_all,
 	fields(
 		command = %c.command().qualified_name,
@@ -122,6 +133,7 @@ pub async fn list(c: Context<'_>) -> Result<()> {
 				.description(description),
 		),
 	)
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 	Ok(())
 }
@@ -142,7 +154,7 @@ pub async fn matches(author: UserId, haystack: &str, db: &Pool<Sqlite>) -> Resul
 #[poise::command(prefix_command, slash_command, rename = "match")]
 /// Tests if your highlights match a given string
 #[tracing::instrument(
-	name = "discord.command.highlight.match",
+	name = "command.highlight.match",
 	skip_all,
 	fields(
 		command = %c.command().qualified_name,
@@ -165,6 +177,7 @@ pub async fn mat(c: Context<'_>, haystack: String) -> Result<()> {
 				.description(itertools::intersperse(x, "\n".to_string()).collect::<String>()),
 		),
 	)
+	.instrument(crate::helpers::discord_operation_span("reply.send"))
 	.await?;
 
 	Ok(())
@@ -173,6 +186,16 @@ pub async fn mat(c: Context<'_>, haystack: String) -> Result<()> {
 #[derive(Debug)]
 pub struct RegexHolder(Vec<(UserId, Regex)>);
 impl RegexHolder {
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
 	pub async fn new(db: Option<&Pool<Sqlite>>) -> Self {
 		use tracing::warn;
 
@@ -210,9 +233,109 @@ impl RegexHolder {
 	pub fn find(&self, haystack: &str) -> HashMap<UserId, String> {
 		self.0
 			.iter()
-			.filter(|&(_user_id, regex)| regex.is_match(haystack))
-			.map(|(user_id, regex)| (*user_id, regex.as_str().to_string()))
+			.enumerate()
+			.filter_map(|(index, (user_id, regex))| {
+				// Keep per-regex spans opt-in: one span per regex on every message can be noisy.
+				let span = tracing::debug_span!(
+					"highlight.match_regex",
+					regex.index = index,
+					regex.matched = tracing::field::Empty,
+				);
+				let matched = span.in_scope(|| regex.is_match(haystack));
+				span.record("regex.matched", matched);
+				matched.then(|| (*user_id, regex.as_str().to_string()))
+			})
 			.collect()
+	}
+}
+
+pub async fn check_message(
+	ctx: &serenity::Context,
+	data: &Data,
+	gid: serenity::GuildId,
+	new_message: &serenity::Message,
+	span: tracing::Span,
+) {
+	let matches = {
+		let highlights = data.highlights.read().await;
+		let regex_span =
+			tracing::info_span!("highlight.match_regexes", regex.count = highlights.len());
+		regex_span.in_scope(|| highlights.find(&new_message.content))
+	};
+	if !matches.is_empty() {
+		span.record("highlight.matched", true);
+		let trigger_span =
+			tracing::info_span!("highlight.trigger", highlight.count = matches.len(),);
+		trigger(ctx, gid, new_message, matches)
+			.instrument(trigger_span)
+			.await;
+	}
+}
+
+async fn trigger(
+	ctx: &serenity::Context,
+	gid: serenity::GuildId,
+	new_message: &serenity::Message,
+	matches: HashMap<UserId, String>,
+) {
+	let message_link = new_message.link();
+	let channel_id = new_message.channel_id;
+	let mut stream = futures::stream::iter(matches)
+		.map(|(person_id, matcher)| {
+			let span = tracing::info_span!("highlight.notify", recipient.id = person_id.get(),);
+			notify_match(ctx, gid, channel_id, person_id, matcher, &message_link).instrument(span)
+		})
+		.buffer_unordered(8);
+	while let Some(()) = stream.next().await {}
+}
+
+async fn notify_match(
+	ctx: &serenity::Context,
+	gid: serenity::GuildId,
+	channel_id: serenity::ChannelId,
+	person_id: UserId,
+	matcher: String,
+	message_link: &str,
+) {
+	if let Ok(member) = gid
+		.member(ctx, person_id)
+		.instrument(discord_operation_span("guild.member"))
+		.await && let Ok(p) = gid
+		.to_partial_guild(ctx)
+		.instrument(discord_operation_span("guild.to_partial_guild"))
+		.await && let Ok(Some(channel)) = if let Ok(Some(channel)) = p
+		.channels(ctx)
+		.instrument(discord_operation_span("guild.channels"))
+		.await
+		.map(|x| x.get(&channel_id).cloned())
+	{
+		Ok(Some(channel))
+	} else {
+		p.get_active_threads(ctx)
+			.instrument(discord_operation_span("guild.get_active_threads"))
+			.await
+			.map(|x| x.threads.iter().find(|th| th.id == channel_id).cloned())
+	} && let perms = p.user_permissions_in(&channel, &member)
+		&& perms.contains(Permissions::VIEW_CHANNEL)
+		&& (channel.kind != ChannelType::PrivateThread
+			|| channel
+				.id
+				.get_thread_member(ctx, member.user.id, true)
+				.instrument(discord_operation_span("channel.get_thread_member"))
+				.await
+				.ok()
+				.map(|x| x.user_id)
+				== Some(member.user.id))
+	{
+		_ = person_id
+			.direct_message(
+				ctx,
+				serenity::CreateMessage::new().content(format!(
+					"your match `{matcher}` was satisfied on message {message_link}",
+				)),
+			)
+			.instrument(discord_operation_span("user.direct_message"))
+			.await;
 	}
 }
 
@@ -222,6 +345,12 @@ mod database {
 	use sqlx::{Pool, Sqlite};
 
 	/// Adds a highlight for a user.
+	#[tracing::instrument(
+		name = "db.highlights.add",
+		skip_all,
+		fields(user.id = user_id.get()),
+		err(Debug),
+	)]
 	pub async fn highlight_add(
 		pool: &Pool<Sqlite>,
 		user_id: UserId,
@@ -229,16 +358,20 @@ mod database {
 	) -> Result<(), Error> {
 		let member_id = u64_to_i64(user_id.get());
 
-		sqlx::query!(
-			r#"
+		crate::telemetry::sqlite_query(
+			"INSERT",
+			"highlights",
+			sqlx::query!(
+				r#"
 			insert into highlights (member_id, highlight)
 				values (?1, ?2)
 				on conflict (member_id, highlight) do nothing
 			"#,
-			member_id,
-			regex
+				member_id,
+				regex
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to add highlight to database")?;
 
@@ -246,6 +379,12 @@ mod database {
 	}
 
 	/// Removes a highlight by ID for a specific user.
+	#[tracing::instrument(
+		name = "db.highlights.remove",
+		skip_all,
+		fields(user.id = user_id.get()),
+		err(Debug),
+	)]
 	pub async fn highlight_remove(
 		pool: &Pool<Sqlite>,
 		user_id: UserId,
@@ -253,12 +392,16 @@ mod database {
 	) -> Result<bool, Error> {
 		let member_id = u64_to_i64(user_id.get());
 
-		let result = sqlx::query!(
-			"delete from highlights where id = ?1 and member_id = ?2",
-			id,
-			member_id
+		let result = crate::telemetry::sqlite_query(
+			"DELETE",
+			"highlights",
+			sqlx::query!(
+				"delete from highlights where id = ?1 and member_id = ?2",
+				id,
+				member_id
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to remove highlight from database")?;
 
@@ -266,17 +409,27 @@ mod database {
 	}
 
 	/// Gets all highlights for a specific user.
+	#[tracing::instrument(
+		name = "db.highlights.get",
+		skip_all,
+		fields(user.id = user_id.get()),
+		err(Debug),
+	)]
 	pub async fn highlight_get(
 		pool: &Pool<Sqlite>,
 		user_id: UserId,
 	) -> Result<Vec<(i64, String)>, Error> {
 		let member_id = u64_to_i64(user_id.get());
 
-		let rows = sqlx::query!(
-			"select id, highlight from highlights where member_id = ?1",
-			member_id
+		let rows = crate::telemetry::sqlite_query(
+			"SELECT",
+			"highlights",
+			sqlx::query!(
+				"select id, highlight from highlights where member_id = ?1",
+				member_id
+			)
+			.fetch_all(pool),
 		)
-		.fetch_all(pool)
 		.await
 		.context("Failed to fetch highlights from database")?;
 
@@ -289,11 +442,15 @@ mod database {
 	}
 
 	/// Gets all highlights from all users.
+	#[tracing::instrument(name = "db.highlights.get_all", skip_all, err(Debug))]
 	pub async fn highlight_get_all(pool: &Pool<Sqlite>) -> Result<Vec<(i64, String)>, Error> {
-		let rows = sqlx::query!("select member_id, highlight from highlights")
-			.fetch_all(pool)
-			.await
-			.context("Failed to fetch all highlights from database")?;
+		let rows = crate::telemetry::sqlite_query(
+			"SELECT",
+			"highlights",
+			sqlx::query!("select member_id, highlight from highlights").fetch_all(pool),
+		)
+		.await
+		.context("Failed to fetch all highlights from database")?;
 
 		let mut highlights = Vec::new();
 		for row in rows {

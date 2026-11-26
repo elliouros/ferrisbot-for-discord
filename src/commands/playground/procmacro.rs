@@ -1,11 +1,12 @@
 use anyhow::Error;
+use tracing::Instrument as _;
 
 use crate::types::Context;
 
 use super::{
 	api::{Channel, CrateType, Edition, Mode, PlayResult, PlaygroundRequest},
 	util::{
-		GenericHelp, ResultHandling, format_play_eval_stderr, generic_help, maybe_wrap,
+		GenericHelp, ResultHandling, format_play_eval_stderr, generic_help, maybe_wrapped,
 		parse_flags, send_reply, stub_message,
 	},
 };
@@ -18,7 +19,7 @@ use super::{
 	category = "Playground"
 )]
 #[tracing::instrument(
-	name = "discord.command.procmacro",
+	name = "command.procmacro",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -34,10 +35,12 @@ pub async fn procmacro(
 	macro_code: poise::CodeBlock,
 	usage_code: poise::CodeBlock,
 ) -> Result<(), Error> {
-	ctx.say(stub_message(ctx)).await?;
+	ctx.say(stub_message(ctx))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	let macro_code = macro_code.code;
-	let usage_code = maybe_wrap(&usage_code.code, ResultHandling::None);
+	let usage_code = maybe_wrapped(&usage_code.code, ResultHandling::None, false);
 
 	let (flags, flag_parse_errors) = parse_flags(flags);
 
@@ -87,7 +90,7 @@ fn main() -> std::io::Result<()> {
 	let mut result: PlayResult = ctx
 		.data()
 		.http
-		.post("https://play.rust-lang.org/execute")
+		.post(ctx.data().external_apis.playground_url("execute"))
 		.json(&PlaygroundRequest {
 			code: &generated_code,
 			channel: Channel::Nightly, // so that inner proc macro gets nightly too
@@ -97,6 +100,10 @@ fn main() -> std::io::Result<()> {
 			mode: Mode::Debug,
 			tests: false,
 		})
+		.with_extension(crate::telemetry::ExternalOperation::new(
+			"rust-playground.execute",
+			"rust-playground",
+		))
 		.send()
 		.await?
 		.json()

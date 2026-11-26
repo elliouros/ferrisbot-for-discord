@@ -4,6 +4,7 @@ use poise::serenity_prelude::{CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter}
 use poise::{CreateReply, serenity_prelude as serenity};
 use serde::Serialize;
 use sqlx::{FromRow, Pool, Sqlite};
+use tracing::Instrument as _;
 
 /*
 SQLite schema for tags:
@@ -58,7 +59,7 @@ struct TagStatsMember {
 /// Display a tag.
 #[poise::command(slash_command, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.tag",
+	name = "command.tags.tag",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -72,7 +73,9 @@ pub async fn tag(ctx: Context<'_>, name: String) -> Result<(), Error> {
 	let db = require_database!(ctx);
 	let tag = database::tag_get(db, &name).await?;
 
-	ctx.say(tag.content).await?;
+	ctx.say(tag.content)
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	database::tag_increase_use_count(db, &name).await?;
 
@@ -96,7 +99,7 @@ pub async fn tag(ctx: Context<'_>, name: String) -> Result<(), Error> {
 	)
 )]
 #[tracing::instrument(
-	name = "discord.command.tags",
+	name = "command.tags",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -120,7 +123,7 @@ pub async fn tags(ctx: Context<'_>) -> Result<(), Error> {
 	aliases("add")
 )]
 #[tracing::instrument(
-	name = "discord.command.tags.create",
+	name = "command.tags.create",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -136,14 +139,18 @@ pub async fn tags_create(ctx: Context<'_>, name: String, content: String) -> Res
 
 	let tag_already_exists = tag.is_ok();
 	if tag_already_exists {
-		ctx.say("Tag already exists").await?;
+		ctx.say("Tag already exists")
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
 	let user_id = ctx.author().id.get();
 	database::tag_create(db, &name, &content, user_id).await?;
 
-	ctx.say("Tag created").await?;
+	ctx.say("Tag created")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	Ok(())
 }
 
@@ -156,7 +163,7 @@ pub async fn tags_create(ctx: Context<'_>, name: String, content: String) -> Res
 	aliases("remove")
 )]
 #[tracing::instrument(
-	name = "discord.command.tags.delete",
+	name = "command.tags.delete",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -170,14 +177,16 @@ pub async fn tags_delete(ctx: Context<'_>, name: String) -> Result<(), Error> {
 	let db = require_database!(ctx);
 	database::tag_delete(db, &name).await?;
 
-	ctx.say("Tag deleted").await?;
+	ctx.say("Tag deleted")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	Ok(())
 }
 
 /// Creates an alias for an already existing tag so you can call it with either of the names.
 #[poise::command(rename = "alias", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.alias",
+	name = "command.tags.alias",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -191,21 +200,25 @@ pub async fn tags_alias(ctx: Context<'_>, existing: String, new: String) -> Resu
 	let db = require_database!(ctx);
 	let tag_already_exists = database::tag_get(db, &new).await.is_ok();
 	if tag_already_exists {
-		ctx.say("Tag already exists").await?;
+		ctx.say("Tag already exists")
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
 	let tag = database::tag_get(db, &existing).await?;
 	database::tag_create_alias(db, &tag.name, &new).await?;
 
-	ctx.say("Alias created").await?;
+	ctx.say("Alias created")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	Ok(())
 }
 
 /// Edits the content of an already existing tag.
 #[poise::command(rename = "edit", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.edit",
+	name = "command.tags.edit",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -221,23 +234,28 @@ pub async fn tags_edit(ctx: Context<'_>, name: String, content: String) -> Resul
 	let editor_is_staff = ctx
 		.author()
 		.has_role(ctx, ctx.data().discord_guild_id, ctx.data().mod_role_id)
+		.instrument(crate::helpers::discord_operation_span("user.has_role"))
 		.await?;
 
 	if tag.restricted != 0 && !editor_is_staff {
-		ctx.say("Tag is restricted").await?;
+		ctx.say("Tag is restricted")
+			.instrument(crate::helpers::discord_operation_span("reply.send"))
+			.await?;
 		return Ok(());
 	}
 
 	database::tag_edit(db, &name, &content, ctx.author().id.get()).await?;
 
-	ctx.say("Tag edited").await?;
+	ctx.say("Tag edited")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	Ok(())
 }
 
 /// This will make the bot post the content in the bot-channel and ping the author upon being used.
 #[poise::command(rename = "restrict", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.restrict",
+	name = "command.tags.restrict",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -251,14 +269,16 @@ pub async fn tags_restrict(ctx: Context<'_>, name: String) -> Result<(), Error> 
 	let db = require_database!(ctx);
 	database::tag_restrict(db, &name).await?;
 
-	ctx.say("Tag restricted").await?;
+	ctx.say("Tag restricted")
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 	Ok(())
 }
 
 /// Shows information about the server tags. If you mention someone, it will show their tags instead.
 #[poise::command(rename = "stats", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.stats",
+	name = "command.tags.stats",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -276,7 +296,9 @@ pub async fn tags_stats(ctx: Context<'_>, member: Option<serenity::UserId>) -> R
 		tags_server_stats(&ctx, db).await?
 	};
 
-	ctx.send(CreateReply::default().embed(embed)).await?;
+	ctx.send(CreateReply::default().embed(embed))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	Ok(())
 }
@@ -330,7 +352,11 @@ async fn tags_member_stats(
 ) -> Result<CreateEmbed, Error> {
 	let stats = database::tag_get_member_stats(db, member.get()).await?;
 
-	let user = ctx.http().get_user(member).await?;
+	let user = ctx
+		.http()
+		.get_user(member)
+		.instrument(crate::helpers::discord_operation_span("user.get"))
+		.await?;
 
 	let embed = CreateEmbed::new()
 		.author(CreateEmbedAuthor::new(&user.name).icon_url(user.face()))
@@ -359,7 +385,7 @@ async fn tags_member_stats(
 /// Shows some stats collected about the tag.
 #[poise::command(rename = "info", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.info",
+	name = "command.tags.info",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -378,8 +404,13 @@ pub async fn tags_info(ctx: Context<'_>, name: String) -> Result<(), Error> {
 
 	let mut embed = CreateEmbed::new()
 		.author(
-			CreateEmbedAuthor::new(&tag.name)
-				.icon_url(ctx.http().get_user(creator_id.into()).await?.face()),
+			CreateEmbedAuthor::new(&tag.name).icon_url(
+				ctx.http()
+					.get_user(creator_id.into())
+					.instrument(crate::helpers::discord_operation_span("user.get"))
+					.await?
+					.face(),
+			),
 		)
 		.title(&tag.name)
 		.field("Created by", format!("<@{creator_id}>"), true)
@@ -403,7 +434,9 @@ pub async fn tags_info(ctx: Context<'_>, name: String) -> Result<(), Error> {
 		embed = embed.field("Last Edit Date", &last_edit_date, true);
 	}
 
-	ctx.send(CreateReply::default().embed(embed)).await?;
+	ctx.send(CreateReply::default().embed(embed))
+		.instrument(crate::helpers::discord_operation_span("reply.send"))
+		.await?;
 
 	Ok(())
 }
@@ -411,7 +444,7 @@ pub async fn tags_info(ctx: Context<'_>, name: String) -> Result<(), Error> {
 /// Lists all tags in the server. If you mention someone, it will show their tags instead.
 #[poise::command(rename = "list", slash_command, ephemeral, category = "Tags")]
 #[tracing::instrument(
-	name = "discord.command.tags.list",
+	name = "command.tags.list",
 	skip_all,
 	fields(
 		command = %ctx.command().qualified_name,
@@ -450,8 +483,14 @@ mod database {
 
 	/// Fetches a tag from the database, including aliases. Returns an error if the tag or alias is
 	/// not found.
+	#[tracing::instrument(
+		name = "db.tags.get",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_get(pool: &Pool<Sqlite>, name: &str) -> Result<Tag, Error> {
-		let query = sqlx::query_as!(
+		let query = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query_as!(
 			Tag,
 			"
 			SELECT name as \"name!\", content as \"content!\", creator_user_id as \"creator_user_id!\", last_editor_user_id, creation_date as \"creation_date!\", last_edit_date, times_used as \"times_used!\", restricted as \"restricted!\"
@@ -465,7 +504,7 @@ mod database {
 			",
 			name
 		)
-		.fetch_one(pool)
+		.fetch_one(pool))
 		.await;
 
 		if let Err(sqlx::Error::RowNotFound) = query {
@@ -476,16 +515,26 @@ mod database {
 	}
 
 	/// Increases the use count of a tag by 1.
+	#[tracing::instrument(
+		name = "db.tags.increase_use_count",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_increase_use_count(pool: &Pool<Sqlite>, name: &str) -> Result<(), Error> {
-		sqlx::query!(
-			"
+		crate::telemetry::sqlite_query(
+			"UPDATE",
+			"tags",
+			sqlx::query!(
+				"
 			UPDATE tags
 			SET times_used = times_used + 1
 			WHERE name = ?1
 			",
-			name
+				name
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to increment tag use count")?;
 
@@ -493,6 +542,12 @@ mod database {
 	}
 
 	/// Creates a new tag in the database.
+	#[tracing::instrument(
+		name = "db.tags.create",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_create(
 		pool: &Pool<Sqlite>,
 		name: &str,
@@ -501,16 +556,20 @@ mod database {
 	) -> Result<(), Error> {
 		let creator_user_id = u64_to_i64(creator_user_id);
 
-		sqlx::query!(
-			"
+		crate::telemetry::sqlite_query(
+			"INSERT",
+			"tags",
+			sqlx::query!(
+				"
 			INSERT INTO tags (name, content, creator_user_id)
 			VALUES (?1, ?2, ?3)
 			",
-			name,
-			content,
-			creator_user_id
+				name,
+				content,
+				creator_user_id
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to create tag")?;
 
@@ -520,21 +579,33 @@ mod database {
 	/// Deletes a tag from the `tag_aliases` table, and if that doesn't delete anything, then it deletes
 	/// on the tags table. If that doesn't delete anything then the tag didn't exist, and it returns
 	/// an error.
+	#[tracing::instrument(
+		name = "db.tags.delete",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_delete(pool: &Pool<Sqlite>, name: &str) -> Result<(), Error> {
-		let deleted_aliases = sqlx::query!("DELETE FROM tag_aliases WHERE alias = ?1", name)
-			.execute(pool)
-			.await
-			.context("Failed to delete tag alias")?;
+		let deleted_aliases = crate::telemetry::sqlite_query(
+			"DELETE",
+			"tag_aliases",
+			sqlx::query!("DELETE FROM tag_aliases WHERE alias = ?1", name).execute(pool),
+		)
+		.await
+		.context("Failed to delete tag alias")?;
 
 		let alias_deleted = deleted_aliases.rows_affected() == 1;
 		if alias_deleted {
 			return Ok(());
 		}
 
-		let deleted_tags = sqlx::query!("DELETE FROM tags WHERE name = ?1", name)
-			.execute(pool)
-			.await
-			.context("Failed to delete tag")?;
+		let deleted_tags = crate::telemetry::sqlite_query(
+			"DELETE",
+			"tags",
+			sqlx::query!("DELETE FROM tags WHERE name = ?1", name).execute(pool),
+		)
+		.await
+		.context("Failed to delete tag")?;
 
 		let tag_deleted = deleted_tags.rows_affected() == 1;
 		if !tag_deleted {
@@ -545,20 +616,30 @@ mod database {
 	}
 
 	/// Creates an alias for a tag.
+	#[tracing::instrument(
+		name = "db.tags.create_alias",
+		skip_all,
+		fields(tag.name = %tag_name),
+		err(Debug),
+	)]
 	pub async fn tag_create_alias(
 		pool: &Pool<Sqlite>,
 		tag_name: &str,
 		alias: &str,
 	) -> Result<(), Error> {
-		sqlx::query!(
-			"
+		crate::telemetry::sqlite_query(
+			"INSERT",
+			"tag_aliases",
+			sqlx::query!(
+				"
 			INSERT INTO tag_aliases (alias, tag_name)
 			VALUES (?1, ?2)
 			",
-			alias,
-			tag_name
+				alias,
+				tag_name
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to create tag alias")?;
 
@@ -566,6 +647,12 @@ mod database {
 	}
 
 	/// Edits the content of a tag or alias. If the tag doesn't exist, it returns an error.
+	#[tracing::instrument(
+		name = "db.tags.edit",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_edit(
 		pool: &Pool<Sqlite>,
 		name: &str,
@@ -574,19 +661,23 @@ mod database {
 	) -> Result<(), Error> {
 		let editor_id = u64_to_i64(editor_id);
 
-		sqlx::query!(
-			"
+		crate::telemetry::sqlite_query(
+			"UPDATE",
+			"tags",
+			sqlx::query!(
+				"
 			UPDATE tags
 			SET content = ?2,
 			    last_editor_user_id = ?3,
 			    last_edit_date = CURRENT_TIMESTAMP
 			WHERE name = ?1
 			",
-			name,
-			content,
-			editor_id
+				name,
+				content,
+				editor_id
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to edit tag")?;
 
@@ -594,9 +685,18 @@ mod database {
 	}
 
 	/// Restricts a tag by tag name or alias.
+	#[tracing::instrument(
+		name = "db.tags.restrict",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_restrict(pool: &Pool<Sqlite>, name: &str) -> Result<(), Error> {
-		sqlx::query!(
-			"
+		crate::telemetry::sqlite_query(
+			"UPDATE",
+			"tags",
+			sqlx::query!(
+				"
 			UPDATE tags
 			SET restricted = 1
 			WHERE name = ?1
@@ -606,9 +706,10 @@ mod database {
 				WHERE alias = ?1
 			)
 			",
-			name
+				name
+			)
+			.execute(pool),
 		)
-		.execute(pool)
 		.await
 		.context("Failed to restrict tag")?;
 
@@ -616,31 +717,38 @@ mod database {
 	}
 
 	/// Gets general stats about the tags in the server.
+	#[tracing::instrument(name = "db.tags.server_stats", skip_all, err(Debug))]
 	pub async fn tag_get_server_stats(pool: &Pool<Sqlite>) -> Result<TagStatsServer, Error> {
-		let total_tag_uses_row = sqlx::query!("SELECT SUM(times_used) as total FROM tags")
-			.fetch_one(pool)
-			.await
-			.context("Failed to fetch total tag uses")?;
+		let total_tag_uses_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!("SELECT SUM(times_used) as total FROM tags").fetch_one(pool),
+		)
+		.await
+		.context("Failed to fetch total tag uses")?;
 		let total_tag_uses = total_tag_uses_row.total.unwrap_or(0);
 
-		let total_number_of_tags_row = sqlx::query!("SELECT COUNT(*) as count FROM tags")
-			.fetch_one(pool)
-			.await
-			.context("Failed to fetch total number of tags")?;
+		let total_number_of_tags_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!("SELECT COUNT(*) as count FROM tags").fetch_one(pool),
+		)
+		.await
+		.context("Failed to fetch total number of tags")?;
 		let total_number_of_tags = total_number_of_tags_row.count;
 
-		let top_3_tags_used = sqlx::query_as!(
+		let top_3_tags_used = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query_as!(
 			Tag,
 			"SELECT name as \"name!\", content as \"content!\", creator_user_id as \"creator_user_id!\", last_editor_user_id, creation_date as \"creation_date!\", last_edit_date, times_used as \"times_used!\", restricted as \"restricted!\" FROM tags ORDER BY times_used DESC LIMIT 3"
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch top tags by usage")?;
 
-		let top_3_tag_creators_rows = sqlx::query!(
+		let top_3_tag_creators_rows = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query!(
 			"SELECT creator_user_id, COUNT(*) as count FROM tags GROUP BY creator_user_id ORDER BY count DESC LIMIT 3"
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch top tag creators")?;
 		let top_3_tag_creators = top_3_tag_creators_rows
@@ -648,10 +756,10 @@ mod database {
 			.map(|row| (row.creator_user_id, row.count))
 			.collect();
 
-		let top_3_tag_creators_by_uses_rows = sqlx::query!(
+		let top_3_tag_creators_by_uses_rows = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query!(
 			"SELECT creator_user_id, SUM(times_used) as total FROM tags GROUP BY creator_user_id ORDER BY total DESC LIMIT 3"
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch top tag creators by uses")?;
 		let top_3_tag_creators_by_uses = top_3_tag_creators_by_uses_rows
@@ -668,36 +776,50 @@ mod database {
 		})
 	}
 
+	#[tracing::instrument(
+		name = "db.tags.member_stats",
+		skip_all,
+		fields(user.id = member),
+		err(Debug),
+	)]
 	pub async fn tag_get_member_stats(
 		pool: &Pool<Sqlite>,
 		member: u64,
 	) -> Result<TagStatsMember, Error> {
 		let member = u64_to_i64(member);
 
-		let total_number_of_tags_row = sqlx::query!(
-			"SELECT COUNT(*) as count FROM tags WHERE creator_user_id = ?1",
-			member
+		let total_number_of_tags_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!(
+				"SELECT COUNT(*) as count FROM tags WHERE creator_user_id = ?1",
+				member
+			)
+			.fetch_one(pool),
 		)
-		.fetch_one(pool)
 		.await
 		.context("Failed to fetch member's tag count")?;
 		let total_number_of_tags = total_number_of_tags_row.count;
 
-		let total_tag_uses_row = sqlx::query!(
-			"SELECT SUM(times_used) as total FROM tags WHERE creator_user_id = ?1",
-			member
+		let total_tag_uses_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!(
+				"SELECT SUM(times_used) as total FROM tags WHERE creator_user_id = ?1",
+				member
+			)
+			.fetch_one(pool),
 		)
-		.fetch_one(pool)
 		.await
 		.context("Failed to fetch member's tag usage count")?;
 		let total_tag_uses = total_tag_uses_row.total.unwrap_or_default();
 
-		let top_3_tags = sqlx::query_as!(
+		let top_3_tags = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query_as!(
 			Tag,
 			"SELECT name as \"name!\", content as \"content!\", creator_user_id as \"creator_user_id!\", last_editor_user_id, creation_date as \"creation_date!\", last_edit_date, times_used as \"times_used!\", restricted as \"restricted!\" FROM tags WHERE creator_user_id = ?1 ORDER BY times_used DESC LIMIT 3",
 			member
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch member's top tags")?;
 
@@ -709,32 +831,50 @@ mod database {
 	}
 
 	/// Returns the times the tag has been used and the total amount of tags.
+	#[tracing::instrument(
+		name = "db.tags.rank",
+		skip_all,
+		fields(tag.name = %name),
+		err(Debug),
+	)]
 	pub async fn tag_get_rank(pool: &Pool<Sqlite>, name: &str) -> Result<(i64, i64), Error> {
-		let times_used_row = sqlx::query!("SELECT times_used FROM tags WHERE name = ?1", name)
-			.fetch_one(pool)
-			.await
-			.context("Failed to fetch tag usage count")?;
+		let times_used_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!("SELECT times_used FROM tags WHERE name = ?1", name).fetch_one(pool),
+		)
+		.await
+		.context("Failed to fetch tag usage count")?;
 		let times_used = times_used_row.times_used;
 
-		let total_tags_row = sqlx::query!("SELECT COUNT(*) as count FROM tags")
-			.fetch_one(pool)
-			.await
-			.context("Failed to fetch total tag count")?;
+		let total_tags_row = crate::telemetry::sqlite_query(
+			"SELECT",
+			"tags",
+			sqlx::query!("SELECT COUNT(*) as count FROM tags").fetch_one(pool),
+		)
+		.await
+		.context("Failed to fetch total tag count")?;
 		let total_tags = total_tags_row.count;
 
 		Ok((times_used, total_tags))
 	}
 
 	/// Lists all tags owned by a user.
+	#[tracing::instrument(
+		name = "db.tags.list_member",
+		skip_all,
+		fields(user.id = user_id),
+		err(Debug),
+	)]
 	pub async fn tag_get_by_member(pool: &Pool<Sqlite>, user_id: u64) -> Result<Vec<Tag>, Error> {
 		let user_id = u64_to_i64(user_id);
 
-		let tags = sqlx::query_as!(
+		let tags = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query_as!(
 			Tag,
 			"SELECT name as \"name!\", content as \"content!\", creator_user_id as \"creator_user_id!\", last_editor_user_id, creation_date as \"creation_date!\", last_edit_date, times_used as \"times_used!\", restricted as \"restricted!\" FROM tags WHERE creator_user_id = ?1",
 			user_id
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch member's tags")?;
 
@@ -742,12 +882,13 @@ mod database {
 	}
 
 	/// Lists all tags.
+	#[tracing::instrument(name = "db.tags.list", skip_all, err(Debug))]
 	pub async fn tag_list(pool: &Pool<Sqlite>) -> Result<Vec<Tag>, Error> {
-		let tags = sqlx::query_as!(
+		let tags = crate::telemetry::sqlite_query("SELECT", "tags", sqlx::query_as!(
 			Tag,
 			"SELECT name as \"name!\", content as \"content!\", creator_user_id as \"creator_user_id!\", last_editor_user_id, creation_date as \"creation_date!\", last_edit_date, times_used as \"times_used!\", restricted as \"restricted!\" FROM tags"
 		)
-		.fetch_all(pool)
+		.fetch_all(pool))
 		.await
 		.context("Failed to fetch tag list")?;
 

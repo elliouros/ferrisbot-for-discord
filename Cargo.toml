@@ -14,8 +14,9 @@ ab_glyph = { version = "0.2", default-features = false }
 anyhow = "1.0"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 futures = "0.3.31"
+http = "1"
 git-version = "0.3.9"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp"] }
 imageproc = { version = "0.25", default-features = false }
 itertools = "0.14"
 opentelemetry = { version = "0.30.0", features = ["trace"] }
@@ -54,10 +55,15 @@ syn = { version = "2.0.104", default-features = false, features = [
   "parsing",
   "printing",
 ] }
-tokio = { version = "1.47", features = ["rt-multi-thread"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.4"
 tracing-log = "0.2.0"
 tracing-opentelemetry = "0.31.0"
 tracing-panic = "0.1.2"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[dev-dependencies]
+insta = "1.49"
+tempfile = "3"
+wiremock = "0.6"
